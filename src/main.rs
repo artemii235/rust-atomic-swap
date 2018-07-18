@@ -1,32 +1,25 @@
 // extern crate jsonrpc_http_server;
 extern crate coins;
 extern crate sha2;
-extern crate ethcore_transaction;
-extern crate ethereum_types;
 extern crate hex;
-extern crate ethkey;
-extern crate rlp;
 extern crate keys;
 extern crate bitcrypto;
 extern crate script;
 extern crate chain;
 extern crate serialization;
 extern crate byteorder;
+extern crate eth;
 
 use std::time::{SystemTime, UNIX_EPOCH};
-
 // use jsonrpc_http_server::*;
 // use jsonrpc_http_server::jsonrpc_core::*;
 use sha2::{ Sha256, Digest };
-use ethcore_transaction::{ Action, Transaction};
-use ethereum_types::{ U256, H160 };
 use hex::FromHex;
-use ethkey::{Secret};
 use keys::{ Secret as BitcoinSecret, Network, Private, KeyPair, Public };
 use keys::bytes::{ Bytes };
 use keys::generator::{ Random, Generator };
 use keys::hash::{ H256, H160 as H160BTC };
-use bitcrypto::{ dhash160 };
+use bitcrypto::{ dhash160, dhash256 };
 use script::{ Opcode, Builder, Script, TransactionInputSigner, UnsignedTransactionInput, SignatureVersion };
 use chain::{ TransactionOutput, TransactionInput, OutPoint, Transaction as BitcoinTransaction };
 use chain::constants::{ SEQUENCE_FINAL };
@@ -35,6 +28,7 @@ use byteorder::{ LittleEndian, WriteBytesExt };
 use coins::{ wait_for_tx_spend, create_rpc_client, read_coin_config, spawn_coin_thread, UnspentOutput };
 use std::env;
 use std::str::FromStr;
+use eth::{ EthClient };
 
 fn key_pair_from_seed(seed: &[u8]) -> KeyPair {
     let mut hasher = Sha256::new();
@@ -344,42 +338,7 @@ fn random_compressed_key_pair() -> KeyPair {
     }).unwrap()
 }
 
-fn main() {
-    /*
-    let mut io = IoHandler::default();
-    io.add_method("say_hello", |_| {
-        Ok(Value::String("hello123".into()))
-    });
-
-    let server = ServerBuilder::new(io)
-        .cors(DomainsValidation::AllowOnly(vec![AccessControlAllowOrigin::Null]))
-        .start_http(&"127.0.0.1:3030".parse().unwrap());
-    */
-
-    let address_bytes = <[u8; 20]>::from_hex("bab36286672fbdc7b250804bf6d14be0df69fa29").unwrap();
-    let address= H160::from(address_bytes);
-    let tx = Transaction {
-        nonce: U256::from(688),
-        value: U256::from_dec_str("10000000000000000").unwrap(),
-        action: Action::Call(address),
-        data: vec![],
-        gas: U256::from(21000),
-        gas_price: U256::from_dec_str("10000000000").unwrap()
-    };
-
-    let secret = match Secret::from_slice(&<[u8; 32]>::from_hex(env::var("PRIV1").unwrap()).unwrap()) {
-        Some(t) => t,
-        None => Secret::zero(),
-    };
-
-    println!("Tx: {:?}", tx);
-    let t = tx.sign(&secret, None);
-
-    let rawtx = rlp::encode(&t).into_vec();
-    println!("Address: {:?}", address);
-    println!("Signed tx: {:?}", t);
-    println!("Secret: {:?}", secret);
-
+fn etomic_beer_swap() {
     let etomic_key_pair = key_pair_from_seed(env::var("SEED1").unwrap().as_bytes());
     let etomic_address = etomic_key_pair.address();
     let beer_config = read_coin_config("/home/artem/.komodo/BEER/BEER.conf");
@@ -582,6 +541,208 @@ fn main() {
     match refund_tx_send_result {
         Ok(res) => println!("Bob deposit spend tx send result: {:?}", res),
         Err(e) => println!("Tx send error: {:?}", e)
+    }
+}
+
+fn eth_beer_swap() {
+    let beer_config = read_coin_config("/home/artem/.komodo/BEER/BEER.conf");
+
+    spawn_coin_thread(beer_config.clone());
+
+    let alice_key_pair = key_pair_from_seed(env::var("SEED1").unwrap().as_bytes());
+    let bob_key_pair = key_pair_from_seed(env::var("SEED2").unwrap().as_bytes());
+    let bob_address = bob_key_pair.address();
+
+    let mut beer_client = create_rpc_client(&beer_config);
+
+    let beer_unspents = beer_client.listunspent(
+        1,
+        999999,
+        &vec![bob_address.to_string()]
+    ).call().unwrap();
+
+    let beer_payment_amount = 0.1;
+
+    let beer_unspent = beer_unspents.iter().find(
+        |ref x| x.amount >= beer_payment_amount
+    ).unwrap();
+
+    let start = SystemTime::now();
+    let since_the_epoch = start.duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+
+    let bob_priv0 = random_compressed_key_pair();
+    let bob_priv1 = random_compressed_key_pair();
+    let bob_privn = random_compressed_key_pair();
+    let alice_priv0 = random_compressed_key_pair();
+    let alice_privm = random_compressed_key_pair();
+
+    let script = bob_deposit_script(
+        since_the_epoch.as_secs() as u32 + 1000,
+        &dhash160(&*bob_privn.private().secret),
+        &dhash160(&*alice_privm.private().secret),
+        &bob_priv0.public(),
+        &alice_priv0.public()
+    );
+
+    let bob_deposit = p2sh_tx(
+        &beer_unspent,
+        &bob_key_pair,
+        &script,
+        beer_payment_amount
+    );
+
+    let tx_send_result = beer_client.sendrawtransaction(&serialize(&bob_deposit).into()).call();
+    match tx_send_result {
+        Ok(res) => println!("Bob deposit tx send result: {:?}", res),
+        Err(e) => println!("Tx send error: {:?}", e)
+    }
+
+    let prev_out = OutPoint {
+        hash: bob_deposit.hash(),
+        index: 0
+    };
+
+    let output = TransactionOutput {
+        value: ((beer_payment_amount - 0.00001) * 100000000 as f64) as u64,
+        script_pubkey: "76a9146d9d2b554d768232320587df75c4338ecc8bf37d88ac".into(),
+    };
+
+    let alice_eth_client = EthClient::new(alice_key_pair.private().secret.to_vec());
+    let bob_eth_client = EthClient::new(bob_key_pair.private().secret.to_vec());
+
+    let alice_payment_id = dhash256(&alice_key_pair.private().secret.to_vec());
+
+    let alice_payment_tx = alice_eth_client.send_alice_payment_eth(
+        alice_payment_id.to_vec(),
+        bob_eth_client.my_address().to_vec(),
+        dhash160(&*alice_privm.private().secret).to_vec(),
+        dhash160(&*bob_privn.private().secret).to_vec(),
+    );
+
+    println!("Sent Alice payment: {:?}", alice_payment_tx);
+
+    let bob_payment_script = bob_payment_script(
+        since_the_epoch.as_secs() as u32 + 1000,
+        &dhash160(&*alice_privm.private().secret),
+        &bob_priv1.public(),
+        &alice_priv0.public()
+    );
+
+    let beer_unspents_2 = beer_client.listunspent(
+        1,
+        999999,
+        &vec![bob_address.to_string()]
+    ).call().unwrap();
+
+    let beer_unspent_2 = beer_unspents_2.iter().find(
+        |ref x| x.amount >= beer_payment_amount
+    ).unwrap();
+
+    let bob_payment_tx = p2sh_tx(&beer_unspent_2, &bob_key_pair, &bob_payment_script, beer_payment_amount);
+
+    let bob_payment_tx_send_result = beer_client.sendrawtransaction(&serialize(&bob_payment_tx).into()).call();
+    match bob_payment_tx_send_result {
+        Ok(res) => println!("Bob payment tx: {:?}", res),
+        Err(e) => println!("Tx send error: {:?}", e)
+    }
+
+    let prev_out_bob_payment = OutPoint {
+        hash: bob_payment_tx.hash(),
+        index: 0
+    };
+
+    let bob_payment_spend_output = TransactionOutput {
+        value: ((beer_payment_amount - 0.00001) * 100000000 as f64) as u64,
+        script_pubkey: Builder::build_p2pkh(&alice_key_pair.public().address_hash()).into(),
+    };
+
+    let bob_payment_spend_script = bob_deposit_spend_script(
+        prev_out_bob_payment.clone(),
+        bob_payment_spend_output.clone(),
+        &alice_priv0,
+        &bob_payment_script,
+        &alice_privm.private().secret
+    );
+
+    let payment_spend_tx = BitcoinTransaction {
+        outputs: vec![bob_payment_spend_output],
+        lock_time: 0,
+        inputs: vec![
+            TransactionInput {
+                script_sig: bob_payment_spend_script.into(),
+                sequence: SEQUENCE_FINAL,
+                script_witness: vec![],
+                previous_output: prev_out_bob_payment
+            }
+        ],
+        version: 1
+    };
+
+    let spend_tx_send_result = beer_client.sendrawtransaction(&serialize(&payment_spend_tx).into()).call();
+    match spend_tx_send_result {
+        Ok(res) => println!("Bob payment spend tx send result: {:?}", res),
+        Err(e) => println!("Tx send error: {:?}", e)
+    }
+
+    let spend_tx = wait_for_tx_spend(beer_config.clone(), &bob_payment_tx.hash().reversed().into(), 0).unwrap();
+    println!("Found bob payment spend tx: {:?}", spend_tx);
+    let a_priv_m_extracted = extract_bob_priv_n(&Script::from(spend_tx.vin[0].clone().script_sig.hex.to_vec()));
+
+    let alice_payment_spend_tx = bob_eth_client.bob_spends_alice_payment(
+        alice_payment_id.to_vec(),
+        alice_eth_client.my_address().to_vec(),
+        dhash160(&*bob_privn.private().secret).to_vec(),
+        a_priv_m_extracted.private().secret.to_vec()
+    );
+
+    println!("Sent Alice payment spent: {:?}", alice_payment_spend_tx);
+
+    let bob_deposit_spend_script_1 = bob_deposit_spend_script(
+        prev_out.clone(),
+        output.clone(),
+        &bob_priv0,
+        &script,
+        &bob_privn.private().secret
+    );
+
+    let deposit_spend_tx = BitcoinTransaction {
+        outputs: vec![output],
+        lock_time: 0,
+        inputs: vec![
+            TransactionInput {
+                script_sig: bob_deposit_spend_script_1.into(),
+                sequence: SEQUENCE_FINAL,
+                script_witness: vec![],
+                previous_output: prev_out
+            }
+        ],
+        version: 1
+    };
+
+    let refund_tx_send_result = beer_client.sendrawtransaction(&serialize(&deposit_spend_tx).into()).call();
+    match refund_tx_send_result {
+        Ok(res) => println!("Bob deposit spend tx send result: {:?}", res),
+        Err(e) => println!("Tx send error: {:?}", e)
+    }
+}
+
+fn main() {
+    /*
+    let mut io = IoHandler::default();
+    io.add_method("say_hello", |_| {
+        Ok(Value::String("hello123".into()))
+    });
+
+    let server = ServerBuilder::new(io)
+        .cors(DomainsValidation::AllowOnly(vec![AccessControlAllowOrigin::Null]))
+        .start_http(&"127.0.0.1:3030".parse().unwrap());
+    */
+    let args: Vec<String> = env::args().collect();
+    match args[1].as_ref() {
+        "ethbeer" => eth_beer_swap(),
+        "etomicbeer" => etomic_beer_swap(),
+        _ => println!("Unknown swap")
     }
 }
 
