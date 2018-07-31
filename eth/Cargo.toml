@@ -3,6 +3,10 @@ name = "eth"
 version = "0.1.0"
 authors = ["Artem Pikulin <ortgma@gmail.com>"]
 
+[lib]
+crate-type = ["staticlib"]
+name = "eth"
+
 [dependencies]
 ethcore-transaction = { git = "https://github.com/paritytech/parity.git" }
 ethkey = { git = "https://github.com/paritytech/parity.git" }
