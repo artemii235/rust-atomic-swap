@@ -13,9 +13,12 @@ use ethabi::{ Contract, Token, Error as EthAbiError };
 use web3::futures::Future;
 use web3::transports::{ Http, EventLoopHandle };
 use web3::{ Web3 };
-use web3::types::{ Transaction as Web3Transaction, TransactionId };
+use web3::types::{ Transaction as Web3Transaction, TransactionId, BlockId, BlockNumber };
 use web3::confirm::TransactionReceiptBlockNumberCheck;
 use std::time::Duration;
+use std::sync::{ Arc, RwLock };
+use std::thread;
+use std::collections::HashMap;
 
 static ALICE_ABI: &'static str = r#"[{"constant":false,"inputs":[{"name":"_dealId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_bob","type":"address"},{"name":"_aliceHash","type":"bytes20"},{"name":"_bobHash","type":"bytes20"},{"name":"_tokenAddress","type":"address"}],"name":"initErc20Deal","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"_dealId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_tokenAddress","type":"address"},{"name":"_alice","type":"address"},{"name":"_bobHash","type":"bytes20"},{"name":"_aliceSecret","type":"bytes"}],"name":"bobClaimsPayment","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"_dealId","type":"bytes32"},{"name":"_bob","type":"address"},{"name":"_aliceHash","type":"bytes20"},{"name":"_bobHash","type":"bytes20"}],"name":"initEthDeal","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":true,"inputs":[{"name":"","type":"bytes32"}],"name":"deals","outputs":[{"name":"dealHash","type":"bytes20"},{"name":"state","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"_dealId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_tokenAddress","type":"address"},{"name":"_bob","type":"address"},{"name":"_aliceHash","type":"bytes20"},{"name":"_bobSecret","type":"bytes"}],"name":"aliceClaimsPayment","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"inputs":[],"payable":false,"stateMutability":"nonpayable","type":"constructor"}]"#;
 static BOB_ABI: &'static str = r#"[{"constant":true,"inputs":[{"name":"","type":"bytes32"}],"name":"payments","outputs":[{"name":"paymentHash","type":"bytes20"},{"name":"lockTime","type":"uint64"},{"name":"state","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_secret","type":"bytes32"},{"name":"_bob","type":"address"},{"name":"_tokenAddress","type":"address"}],"name":"aliceClaimsPayment","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_secret","type":"bytes32"},{"name":"_alice","type":"address"},{"name":"_tokenAddress","type":"address"}],"name":"bobClaimsDeposit","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[{"name":"","type":"bytes32"}],"name":"deposits","outputs":[{"name":"depositHash","type":"bytes20"},{"name":"lockTime","type":"uint64"},{"name":"state","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_bob","type":"address"},{"name":"_tokenAddress","type":"address"},{"name":"_secretHash","type":"bytes20"}],"name":"aliceClaimsDeposit","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_alice","type":"address"},{"name":"_secretHash","type":"bytes20"},{"name":"_lockTime","type":"uint64"}],"name":"bobMakesEthPayment","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_alice","type":"address"},{"name":"_secretHash","type":"bytes20"},{"name":"_tokenAddress","type":"address"},{"name":"_lockTime","type":"uint64"}],"name":"bobMakesErc20Deposit","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_alice","type":"address"},{"name":"_secretHash","type":"bytes20"},{"name":"_tokenAddress","type":"address"},{"name":"_lockTime","type":"uint64"}],"name":"bobMakesErc20Payment","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_alice","type":"address"},{"name":"_secretHash","type":"bytes20"},{"name":"_lockTime","type":"uint64"}],"name":"bobMakesEthDeposit","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[{"name":"_txId","type":"bytes32"},{"name":"_amount","type":"uint256"},{"name":"_alice","type":"address"},{"name":"_tokenAddress","type":"address"},{"name":"_secretHash","type":"bytes20"}],"name":"bobClaimsPayment","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"inputs":[],"payable":false,"stateMutability":"nonpayable","type":"constructor"}]"#;
@@ -50,21 +53,46 @@ pub fn extract_b_priv_n(data: Vec<u8>) -> Result<Vec<u8>, EthAbiError> {
 }
 
 pub struct EthClient {
-    web3: Web3<Http>,
+    pub web3: Web3<Http>,
     key_pair: KeyPair,
-    _event_loop: EventLoopHandle
+    _event_loop: EventLoopHandle,
+    transactions: RwLock<HashMap<H256, Web3Transaction>>,
+    block_number: RwLock<u64>
+}
+
+pub fn spawn_coin_thread(eth_client: Arc<EthClient>) {
+    thread::spawn(move || {
+        loop {
+            let eth_block = eth_client.web3.eth().block_number().wait().unwrap();
+            if *eth_client.block_number.read().unwrap() < eth_block.into() {
+                for number in *eth_client.block_number.read().unwrap() + 1..=eth_block.into() {
+                    let block_data = eth_client.web3.eth().block_with_txs(BlockId::Number(BlockNumber::Number(number))).wait().unwrap();
+                    let mut transactions = eth_client.transactions.write().unwrap();
+                    for transaction in block_data.transactions.iter() {
+                        transactions.insert(transaction.hash.clone(), transaction.clone());
+                    }
+                }
+                *eth_client.block_number.write().unwrap() = eth_block.into();
+            }
+            thread::sleep(Duration::from_millis(15000));
+        }
+    });
 }
 
 impl EthClient {
-    pub fn new(secret: Vec<u8>) -> Self {
+    pub fn new(secret: Vec<u8>) -> Arc<Self> {
         let (event_loop, transport) = web3::transports::Http::new("http://195.201.0.6:8545").unwrap();
         let web3 = web3::Web3::new(transport);
 
-        EthClient {
+        let res = Arc::new(EthClient {
             web3,
             _event_loop: event_loop,
-            key_pair: KeyPair::from_secret_slice(&secret).unwrap()
-        }
+            key_pair: KeyPair::from_secret_slice(&secret).unwrap(),
+            transactions: RwLock::new(HashMap::new()),
+            block_number: RwLock::new(3707894)
+        });
+        spawn_coin_thread(res.clone());
+        res
     }
 
     pub fn send_alice_payment_eth(
@@ -298,6 +326,31 @@ impl EthClient {
 
     pub fn my_address(&self) -> H160 {
         self.key_pair.address()
+    }
+
+    pub fn find_bob_tx_spend(&self, tx_id: Vec<u8>, function: &'static str) -> Result<Web3Transaction, &'static str> {
+        let abi = Contract::load(BOB_ABI.as_bytes()).unwrap();
+        let eth_function = abi.function(function).unwrap();
+        let transactions = self.transactions.read().unwrap();
+        let option = transactions.iter().find(
+            |(ref _x, ref y)| {
+                if y.to == Some(H160::from(BOB_CONTRACT)) {
+                    if y.input.0.as_slice()[0..4] == eth_function.short_signature() {
+                        let decoded = eth_function.decode_input(&y.input.0).unwrap();
+                        println!("Decoded: {:?}", decoded);
+                        decoded[0] == Token::FixedBytes(tx_id.clone())
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+        );
+        match option {
+            Some((x, y)) => Ok(y.clone()),
+            None => Err("Transaction spend was not found")
+        }
     }
 }
 

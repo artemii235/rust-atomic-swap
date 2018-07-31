@@ -450,7 +450,7 @@ dependencies = [
 [[package]]
 name = "ethabi"
 version = "6.0.0"
-source = "git+https://github.com/artemii235/ethabi#c11c8a87a704ec6131072814ac2c0c8c93c52b5e"
+source = "git+https://github.com/artemii235/ethabi#85d41322ea57bde92697f680b66482ddefce91a0"
 dependencies = [
  "error-chain 0.12.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "ethereum-types 0.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1494,7 +1494,7 @@ dependencies = [
  "lazy_static 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.42 (registry+https://github.com/rust-lang/crates.io-index)",
  "num_cpus 1.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "rand 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rand 0.3.22 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

@@ -95,7 +95,7 @@ pub fn spawn_coin_thread(coin_config: Arc<CoinConfig>) {
                         let transaction = rpc_client.getrawtransaction(&txid, 1).call();
                         match transaction {
                             Ok(tx) => { coin_config.transactions.write().unwrap().insert(tx.txid.clone(), tx); },
-                            Err(_e) => println!("Error parsing!")
+                            Err(_e) => ()
                         }
                     }
                 }

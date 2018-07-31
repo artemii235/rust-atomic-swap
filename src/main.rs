@@ -10,11 +10,10 @@ extern crate serialization;
 extern crate byteorder;
 extern crate eth;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{ SystemTime, UNIX_EPOCH, Duration };
 // use jsonrpc_http_server::*;
 // use jsonrpc_http_server::jsonrpc_core::*;
 use sha2::{ Sha256, Digest };
-use hex::FromHex;
 use keys::{ Secret as BitcoinSecret, Network, Private, KeyPair, Public };
 use keys::bytes::{ Bytes };
 use keys::generator::{ Random, Generator };
@@ -27,8 +26,8 @@ use serialization::{ serialize };
 use byteorder::{ LittleEndian, WriteBytesExt };
 use coins::{ wait_for_tx_spend, create_rpc_client, read_coin_config, spawn_coin_thread, UnspentOutput };
 use std::env;
-use std::str::FromStr;
-use eth::{ EthClient };
+use eth::{ EthClient, extract_b_priv_n as extract_b_priv_n_eth, extract_a_priv_m as extract_a_priv_m_eth };
+use std::thread;
 
 fn key_pair_from_seed(seed: &[u8]) -> KeyPair {
     let mut hasher = Sha256::new();
@@ -611,7 +610,7 @@ fn eth_beer_swap() {
     let alice_eth_client = EthClient::new(alice_key_pair.private().secret.to_vec());
     let bob_eth_client = EthClient::new(bob_key_pair.private().secret.to_vec());
 
-    let alice_payment_id = dhash256(&alice_key_pair.private().secret.to_vec());
+    let alice_payment_id = dhash256(&alice_privm.private().secret.to_vec());
 
     let alice_payment_tx = alice_eth_client.send_alice_payment_eth(
         alice_payment_id.to_vec(),
@@ -725,6 +724,58 @@ fn eth_beer_swap() {
         Ok(res) => println!("Bob deposit spend tx send result: {:?}", res),
         Err(e) => println!("Tx send error: {:?}", e)
     }
+
+    let eth_bob_deposit = bob_eth_client.bob_sends_eth_deposit(
+        alice_payment_id.to_vec(),
+        alice_eth_client.my_address().to_vec(),
+        dhash160(&*bob_privn.private().secret).to_vec(),
+        since_the_epoch.as_secs() + 1000,
+    );
+    println!("Bob eth deposit: {:?}", eth_bob_deposit);
+
+    let eth_bob_refunds_deposit = bob_eth_client.bob_refunds_deposit(
+        alice_payment_id.to_vec(),
+        alice_eth_client.my_address().to_vec(),
+        bob_privn.private().secret.to_vec()
+    );
+
+    println!("Bob eth deposit refund: {:?}", eth_bob_refunds_deposit);
+
+    bob_eth_client.wait_confirm(eth_bob_refunds_deposit);
+    thread::sleep(Duration::from_millis(60000));
+
+    let found_bob_spend = bob_eth_client.find_bob_tx_spend(alice_payment_id.to_vec(), "bobClaimsDeposit").unwrap();
+    println!("Found bob spend: {:?}", found_bob_spend);
+
+    let extracted_priv_n = extract_b_priv_n_eth(found_bob_spend.input.0).unwrap();
+    println!("Extracted b priv n eth: {:?}", extracted_priv_n);
+
+    let eth_bob_payment = bob_eth_client.bob_sends_eth_payment(
+        alice_payment_id.to_vec(),
+        alice_eth_client.my_address().to_vec(),
+        dhash160(&*alice_privm.private().secret).to_vec(),
+        since_the_epoch.as_secs() + 1000,
+    );
+
+    println!("Bob eth payment: {:?}", eth_bob_payment);
+    bob_eth_client.wait_confirm(eth_bob_payment);
+
+    let eth_alice_spend = alice_eth_client.alice_claims_bob_payment(
+        alice_payment_id.to_vec(),
+        alice_privm.private().secret.to_vec(),
+        bob_eth_client.my_address().to_vec()
+    );
+
+    println!("Alice spent bob eth {:?}", eth_alice_spend);
+
+    bob_eth_client.wait_confirm(eth_alice_spend);
+    thread::sleep(Duration::from_millis(60000));
+
+    let found_bob_payment_spent = bob_eth_client.find_bob_tx_spend(alice_payment_id.to_vec(), "aliceClaimsPayment").unwrap();
+
+    let extracted_a_priv_m = extract_a_priv_m_eth(found_bob_payment_spent.input.0);
+
+    println!("Extracted a priv m eth: {:?}", extracted_a_priv_m);
 }
 
 fn main() {
